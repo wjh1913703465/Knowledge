@@ -1,1 +1,174 @@
 # the knowledge of nccl is from https://docs.nvidia.com/deeplearning/nccl/user-guide/docs
+原文链接：Overview of NCCL ‒ NCCL 2.17.1 documentation
+Overview
+NVIDIA Collective Communications Library（NCCL）是一个提供 GPU 间通信原语的库，这些原语具有拓扑感知能力，可以轻松集成到应用程序中。
+NCCL 实现集体通信和点对点发送/接收原语。它不是一个成熟的并行编程框架；相反，它是一个专注于加速 GPU 间通信的库。
+  NCCL 提供以下集体通信原语：
+  - Allreduce
+  - Broadcast
+  - Reduce
+  - AllGather
+  - ReduceScatter
+此外，它还允许点对点发送/接收通信，从而允许scatter, gather, 和all-to-all操作。
+通信处理器之间的紧密同步是集体通信的一个关键方面。传统上，基于 CUDA 的集合将通过 CUDA 内存复制操作和用于本地缩减的 CUDA 内核的组合来实现。另一方面，NCCL 在处理通信和计算操作的单个内核中实现每个集合体。这允许快速同步并最大限度地减少达到峰值带宽所需的资源。
+NCCL 方便地消除了开发人员为特定机器优化其应用程序的需要。NCCL 在节点内和跨节点的多个 GPU 上提供快速集合。它支持多种互连技术，包括 PCIe、NVLINK、InfiniBand Verbs 和 IP sockets。
+除了性能之外，编程的简便性是 NCCL 设计中的首要考虑因素。NCCL 使用简单的 C API，可以通过多种编程语言轻松访问。NCCL 紧跟 MPI（消息传递接口）定义的流行集合 API。因此，任何熟悉 MPI 的人都会发现 NCCL 的 API 使用起来非常自然。与 MPI 略有不同，NCCL 集体采用“stream”参数，它提供与 CUDA 编程模型的直接集成。最后，NCCL 与几乎任何多 GPU 并行化模型兼容，例如：
+  - 所有 GPU 的单线程控制
+  - 多线程，例如，每个 GPU 使用一个线程
+  - 多进程，例如 MPI
+NCCL 在深度学习框架中找到了很好的应用，其中 AllReduce 集体被大量用于神经网络训练。NCCL 提供的多 GPU 和多节点通信可以有效扩展神经网络训练。
+
+Using NCCL
+集体通信原语是一组 CUDA 设备之间数据传输的通用模式。通信算法涉及许多一起通信的处理器。每个 CUDA 设备在通信组内通过基于零的index或rank来标识。每个rank都使用一个通信器对象来引用旨在协同工作的 GPU 的集合。创建通信器是启动任何通信操作之前所需的第一步。
+Creating a Communicator
+创建通信器时，必须为作为通信器一部分的 n 个 CUDA 设备中的每一个分配 0 到 n-1 之间的唯一等级。不支持多次使用同一 CUDA 设备作为同一 NCCL 通信器的不同等级，这可能会导致挂起。
+给定等级到 CUDA 设备的静态映射，ncclCommInitRank()和ncclCommInitRankConfig()函数 ncclCommInitAll()将创建通信器对象，每个通信器对象都与固定等级和 CUDA 设备相关联。这些对象随后将用于启动通信操作。
+在调用之前ncclCommInitRank()，您需要首先创建一个唯一的对象，所有进程和线程将使用该对象来同步并理解它们是同一通信器的一部分。这是通过调用 ncclGetUniqueId()函数来完成的。
+该ncclGetUniqueId()函数返回一个 ID，该 ID 必须使用任何 CPU 通信系统广播给所有参与的线程和进程，例如，将 ID 指针传递给多个线程，或使用 MPI 或其他并行环境将其广播给其他进程，例如，插座。
+您还可以调用 ncclCommInitAll 操作在单个进程中一次创建 n 个通信器对象。由于它仅限于单个进程，因此此功能不允许节点间通信。ncclCommInitAll 相当于调用 ncclGetUniqueId 和 ncclCommInitRank 的组合。
+以下示例代码是 ncclCommInitAll 的简化实现。
+ncclResult_t ncclCommInitAll(ncclComm_t* comm, int ndev, const int* devlist) {
+  ncclUniqueId Id;
+  ncclGetUniqueId(&Id);
+  ncclGroupStart();
+for (int i=0; i<ndev; i++) {
+  cudaSetDevice(devlist[i]);
+  ncclCommInitRank(comm+i, ndev, Id, i);
+}
+ncclGroupEnd();
+}
+  相关链接：
+- ncclCommInitAll()
+- ncclGetUniqueId()
+- ncclCommInitRank()
+Creating a communication with options
+该ncclCommInitRankConfig()函数允许创建具有特定选项的 NCCL 通信。
+NCCL 支持的配置参数列在此处ncclConfig_t。
+例如，“阻塞”可以设置为 0 以要求 NCCL 从不阻塞任何 NCCL 调用，同时也可以设置其他配置参数以更精确地定义通信器行为。一个简单的示例代码如下所示：
+[图片]
+
+Using multiple NCCL communicators concurrently
+使用多个 NCCL 通信器需要小心同步，否则会导致死锁。
+NCCL 内核处于阻塞状态（等待数据到达），任何 CUDA 操作都可能导致设备同步，这意味着它将等待所有 NCCL 内核完成。这会很快导致死锁，因为 NCCL 操作自己执行 CUDA 调用。
+因此，对不同通信器的操作应该在不同的时期使用锁定机制，并且应用程序应该确保操作以相同的顺序跨级别提交。
+启动多个通信操作（在不同的流上）可能会起作用，只要它们适合 GPU，但如果 NCCL 每个操作使用更多的 CUDA 块，或者如果 NCCL 集体内部使用的一些调用要执行设备同步，则可能随时中断（例如，动态分配一些 CUDA 内存）。
+
+Finalizing a communicator
+ncclCommFinalize 会将通信器从ncclSuccess状态转换为ncclInProgress状态，开始在后台完成所有操作并与可能正在使用资源与其他级别进行通信的其他级别同步。所有未完成的操作和与通信器关联的网络相关资源都将使用 ncclCommFinalize 刷新和释放。一旦所有 NCCL 操作完成，通信器将转换为ncclSuccess状态。用户可以使用 ncclCommGetAsyncError 查询该状态。如果通信器被标记为非阻塞，则此操作是非阻塞的；否则，它是阻塞的。
+Destroying a communicator
+完成通信器后，下一步是释放所有资源，包括通信器本身。可以使用 ncclCommDestroy 销毁与通信器关联的本地资源。如果在调用 ncclCommDestroy 之前通信器的状态变为ncclSuccess，则 ncclCommDestroy 调用将保证非阻塞；相反，ncclCommDestroy 可能会被阻塞。在所有情况下，ncclCommDestroy 调用将释放通信器的资源并返回，并且在 ncclCommDestroy 返回后不应再访问通信器。
+
+Collective Operations
+每个rank（CUDA 设备）调用集体操作以形成完整的集体操作。如果不这样做，将导致其他队伍无限期地等待。
+AllReduce
+AllReduce 操作正在跨设备对数据（例如，sum、min、max）执行归约，并将结果写入每个等级的接收缓冲区。
+在 k 个等级之间的 allreduce 操作中执行求和，每个等级将提供一个包含 N 个值的数组 Vk，并接收一个包含 N 个值的相同数组 S，其中 S[i] = V0[i]+V1[i]+... +Vk-1[i]。
+[图片]
+相关链接：ncclAllReduce()。
+Broadcast
+广播操作将根等级上的 N 元素缓冲区复制到所有等级。
+[图片]
+重要说明：根参数是等级之一，而不是设备编号，因此受不同等级到设备映射的影响。
+相关链接：ncclBroadcast()。
+Reduce
+Reduce 操作执行与 AllReduce 相同的操作，但只将结果写入指定根级的接收缓冲区。
+[图片]
+重要说明：root 参数是其中一个等级（不是设备编号），因此会受到不同等级到设备映射的影响。
+注意：一个 Reduce 后跟一个 Broadcast，相当于 AllReduce 操作。
+相关链接：ncclReduce()。
+AllGather
+AllGather 操作将来自 k 个等级的 N 个值收集到大小为 k*N 的输出中，并将该结果分配给所有等级。
+输出按等级索引排序。因此，AllGather 操作会受到不同等级或设备映射的影响。
+[图片]
+注意：执行 ReduceScatter，然后执行 AllGather，相当于 AllReduce 操作。
+相关链接：ncclAllGather()。
+ReduceScatter
+ReduceScatter 操作执行与 Reduce 操作相同的操作，只是结果分散在等级之间的相等块中，每个等级根据其等级索引获得一块数据。
+ReduceScatter 操作受不同等级或设备映射的影响，因为等级决定数据布局。
+[图片]
+相关链接：ncclReduceScatter()
+
+Data Point
+  通常 NCCL 将接受任何 CUDA 指针，这些指针可从与通信器对象关联的 CUDA 设备访问。这包括：
+- CUDA 设备本地的设备内存
+- 使用 CUDA SDK API cudaHostRegister 或 cudaGetDevicePointer 注册的主机内存
+- 托管和统一内存
+  唯一的例外是设备内存位于另一台设备上，但可以使用对等访问从当前设备访问。
+
+CUDA Stream Semantics
+NCCL 调用与流相关联，并作为集体通信函数的最后一个参数传递。当操作有效地排入给定流时，NCCL 调用返回，或者返回错误。然后在 CUDA 设备上异步执行集体操作。可以使用标准 CUDA 语义查询操作状态，例如，调用 cudaStreamSynchronize 或使用 CUDA 事件。
+Mixing Multiple Streams within the same ncclGroupStart/End() group
+NCCL 允许在群呼中使用多个流。这将在 NCCL 内核启动之前强制所有流的流依赖性，并阻止所有流，直到 NCCL 内核完成。
+它的行为就好像 NCCL 组操作已发布到每个流上，但如果它是单个操作，它将导致流之间的全局同步点。
+
+Group Calls
+组函数 (ncclGroupStart/ncclGroupEnd) 可用于将多个调用合并为一个。这需要用于三个目的：从一个线程管理多个 GPU（以避免死锁），聚合通信操作以提高性能，或合并多个发送/接收点对点操作（请参阅点对点通信部分） 。所有三种用法都可以组合在一起，但有一个例外：对的调用ncclCommInitRank() 不能与其他用法合并。
+Management Of Multiple GPUs From One Thread
+当单个线程管理多个设备时，必须使用组语义。这是因为在给定流上有效发布 NCCL 操作之前，每个 NCCL 调用可能必须阻塞，等待其他线程/等级到达。因此，如下所示的多个设备上的简单循环可能会阻塞等待其他设备的第一个调用：
+[图片]
+要定义这些调用是同一集体操作的一部分，应使用 ncclGroupStart 和 ncclGroupEnd：
+[图片]
+这将告诉 NCCL 将 ncclGroupStart 和 ncclGroupEnd 之间的所有调用视为对许多设备的单个调用。
+注意：当在组内调用时，流操作（如 ncclAllReduce）可以返回而无需在流上排队操作。因此，只有在 ncclGroupEnd 返回后才能调用 cudaStreamSynchronize 等流操作。
+当一个线程管理多个设备时，还必须使用组调用来创建通信器：
+[图片]
+
+Aggregated Operations 
+组语义还可用于在单个 NCCL 启动中执行多个集体操作。这对于减少启动开销很有用，换句话说，延迟，因为对于多个操作它只发生一次。初始化函数不能与其他初始化函数聚合，也不能与通信函数聚合。
+集体操作的聚合可以简单地通过在 ncclGroupStart / ncclGroupEnd 部分中多次调用 NCCL 来完成。
+在以下示例中，我们将一个广播和两个 allReduce 操作一起作为单个 NCCL 启动。
+[图片]
+允许将聚合与多 GPU 启动相结合，并在一个组启动中使用不同的通信器，如从一个线程管理多个 GPU 主题中所示。组合多 GPU 启动和聚合时，ncclGroupStart 和 ncclGroupEnd 可以使用一次或在每个级别使用。以下示例对来自不同层和多个 CUDA 设备的 allReduce 操作进行了分组：
+ncclGroupStart();
+for (int i=0; i<nlayers; i++) {
+  ncclGroupStart();
+  for (int g=0; g<ngpus; g++) {
+  ncclAllReduce(sendbuffs[g]+offsets[i], recvbuffs[g]+offsets[i], counts[i], datatype[i], comms[g], streams[g]);
+  }
+  ncclGroupEnd();
+}
+ncclGroupEnd();
+注意：NCCL 操作只会在最后一次调用 ncclGroupEnd 时作为一个整体启动。for 循环中的 ncclGroupStart 和 ncclGroupEnd 调用不是必需的，并且什么也不做。
+Nonblocking Group Operation
+如果通过 ncclCommInitRankConfig 将通信器标记为非阻塞，则组函数相应地变为异步。在这种情况下，如果用户在一个组中发出多个 NCCL 操作，从 ncclGroupEnd() 返回可能并不意味着 NCCL 通信内核已被发出到 CUDA 流。如果 ncclGroupEnd() 返回 ncclSuccess，则表示 NCCL 内核已发布到流；如果它返回 ncclInProgress，则意味着 NCCL 内核正在后台发布到流。用户有责任在调用相关的 CUDA 调用（例如 cudaStreamSynchronize）之前确保通信器的状态变为 ncclSuccess：
+ncclGroupStart();
+for (int g=0; g<ngpus; g++) {
+ncclAllReduce(sendbuffs[g]+offsets[i], recvbuffs[g]+offsets[i], counts[i], datatype[i], comms[g], streams[g]);
+}
+ret = ncclGroupEnd();
+if (ret == ncclInProgress) {
+  for (int g=0; g<ngpus; g++) {
+    do {
+    ncclCommGetAsyncError(comms[g], &state);
+    } while (state == ncclInProgress);}
+  } 
+else if (ret == ncclSuccess) {
+  /* Successfully issued /
+  printf("NCCL kernel issue succeeded\n");
+} else {
+  / Errors happen */
+  reportErrorAndRestart();
+}
+for (int g=0; g<ngpus; g++) {
+cudaStreamSynchronize(streams[g]);
+}
+Point-to-point communication
+点对点通信可用于表达等级之间的任何通信模式。任何点对点通信都需要两次 NCCL 调用：一个调用ncclSend()在一个等级上，一个对应的ncclRecv()在另一个等级上，具有相同的计数和数据类型。
+可以将对不同对等点的多个调用ncclSend()和ncclRecv()针对不同对等点的多个调用融合在一起ncclGroupStart()并ncclGroupEnd()形成更复杂的通信模式，例如一对一（分散）、一对一（聚集）、所有人或与邻居的通信N维空间。
+组内的点对点调用将阻塞，直到该组调用完成，但组内的调用可以被视为独立进行，因此永远不应相互阻塞。因此，重要的是合并需要同时进行的调用以避免死锁。
+下面是并行应用程序使用的经典点对点通信模式的几个示例。NCCL 语义允许每个等级具有不同大小、数据类型和缓冲区的所有变体。
+Sendrecv
+在 MPI 术语中，sendrecv 操作是指两个等级交换数据，同时发送和接收数据。这可以通过将 ncclSend 和 ncclRecv 调用合并为一个来完成：
+[图片]
+One-to-all (scatter)
+root可以通过将所有发送和接收操作合并到一个组中来表示来自等级的一对多操作：
+[图片]
+All-to-one (gather)
+root类似地，将以这种方式实现对等级的一对一操作：
+[图片]
+All-to-all
+一个 all-to-all 操作将是发送/接收操作到/从所有对等点的合并循环：
+[图片]
+Neighbor exchange
+最后，可以通过以下方式与 N 维空间中的邻居交换数据：
+[图片]
